@@ -1,0 +1,232 @@
+#! /bin/bash
+
+
+''' ***********************************************
+
+Script for Brabec et al. 2022
+Author - Jeremy Gauthier
+
+*********************************************** '''
+
+#Genome assembly
+##Base calling
+guppy_basecaller -q 0 --recursive --config dna_r9.4.1_450bps_hac.cfg -i ./fast5_pass -s ./fast5_pass_2 -x auto
+
+##Genome assembly with Flye
+flye --nano-raw ./Proteo_highaccur.fastq --out-dir ./OUT --threads 6
+
+##Polishing
+nthits -b 36 -k 40 -t 48 --outbloom --solid IBC_1_Ex67_4_1.fastq.gz IBC_1_Ex67_4_2.fastq.gz
+ntedit -f assembly.fasta -r solids_k40.bf -b Proteo_flye_assembly_solids_k40
+
+##kmer estimations
+mkdir tmp
+ls *.fastq > FILES
+kmc -k31 -t1 @FILES reads tmp/
+kmc_tools transform reads histogram reads.histo
+genomescope.R -i reads.histo -o output -k 31
+
+##Genome completeness estimation with BUSCO
+run_BUSCO.py -i ./flye_assembly_solids_k40_edited.fa -o Proteo_flye_assembly_polished_busco -l ./metazoa_odb9/ -m genome -c 10 -sp fly
+
+#ddRAD data analyses
+##demultiplexing with IpyRAD
+ipyrad -p ./params_ipyrad -s 12
+with 
+proteo_ALL                     ## [0] [assembly_name]: Assembly name. Used to name output directories for assembly steps
+Proteo_ALL                      ## [1] [project_dir]: Project dir (made in curdir if not present)
+                               ## [2] [raw_fastq_path]: Location of raw non-demultiplexed fastq files
+barcodes_proteo_ALL.txt                               ## [3] [barcodes_path]: Location of barcodes file
+*fastq.gz                               ## [4] [sorted_fastq_path]: Location of demultiplexed/sorted fastq files
+pairddrad                            ## [7] [datatype]: Datatype (see docs): rad, gbs, ddrad, etc.
+CATG,TA                         ## [8] [restriction_overhang]: Restriction overhang (cut1,) or (cut1, cut2)
+5                              ## [9] [max_low_qual_bases]: Max low quality base calls (Q<20) in a read
+33                             ## [10] [phred_Qscore_offset]: phred Q score offset (33 is default and very standard)
+1                              ## [15] [max_barcode_mismatch]: Max number of allowable mismatches in barcodes
+2                              ## [16] [filter_adapters]: Filter for adapters/primers (1 or 2=stricter)
+35                             ## [17] [filter_min_trim_len]: Min length of reads after adapter trim
+0, 0, 0, 0                     ## [25] [trim_reads]: Trim raw read edges (R1>, <R1, R2>, <R2) (see docs)
+
+##read quality evaluation with FASTQC
+for i in `ls *_.fastq.gz` ; do fastqc "$i" ; done
+
+##Mapping and cleaning
+for i in `ls *.trimmed_R1_.fastq.gz`
+	do
+	sample=`echo $i | sed -e 's/.trimmed_R1_.fastq.gz//g'`
+	bwa mem Proteo_flye_assembly_solids_k40_edited.fa "$sample".trimmed_R1_.fastq.gz "$sample".trimmed_R2_.fastq.gz > "$sample"_on_ref.sam
+	samtools sort "$sample"_on_ref.sam -o temp_sorted.bam
+	samtools view -bF 4 -q 20 temp_sorted.bam > temp_sorted_keep.bam
+	java -jar -mx128G picard.jar CreateSequenceDictionary R=Proteo_flye_assembly_solids_k40_edited.fa O=Proteo_flye_assembly_solids_k40_edited.dict
+	java -jar -mx128G picard.jar AddOrReplaceReadGroups I=temp_B_sorted_keep.bam O=temp_sorted_keep_rg.bam ID=["$sample"] RGLB=[id] PL=[pl] PU=[pu] SM=["$sample"]
+	samtools index temp_sorted_keep_rg.bam
+	java -jar -Xmx128G GenomeAnalysisTK.jar -T RealignerTargetCreator -I temp_sorted_keep_rg.bam -R Proteo_flye_assembly_solids_k40_edited.fa -o temp.intervals
+	java -jar -Xmx128G GenomeAnalysisTK.jar -T IndelRealigner -I temp_sorted_keep_rg.bam -R Proteo_flye_assembly_solids_k40_edited.fa -targetIntervals temp.intervals -o "$sample"_sorted_keep_rg_realign.bam
+	rm temp*
+	done
+
+##SNP calling
+samples=""
+for data in `ls *realign.bam`
+	do
+	samples=$samples" -I "$data
+	done
+gatk HaplotypeCaller -R Proteo_flye_assembly_solids_k40_edited.fa -O gatk4_snp.vcf $samples
+
+##VCF file filter with VCFtools
+vcftools --vcf gatk4_snp.vcf --minGQ 20 --max-missing 0.5 --keep list_samples --min-alleles 2 --max-alleles 2 --remove-indels
+###gatk4_snp_q20_miss05_snponly_bi.recode.vcf
+
+##Filter spaced SNPs
+python3 vcf_filter_spaced.py -i gatk4_snp_q20_miss05_snponly_bi.recode.vcf -o spaced_gatk4_snp_q20_miss05_snponly_bi.recode.vcf -s 200
+
+##Convertion in structure format
+vcf2structure.sh spaced_gatk4_snp_q20_miss05_snponly_bi.recode.vcf
+
+##run Structure on spaced_gatk4_snp_q20_miss05_snponly_bi.recode.str
+for i in `seq 1 3`
+	do
+	for j in `seq 1 10`
+		do
+		mkdir st"$i"_"$j"_"$1".dir
+		nb_sample=`grep -c "." $1 | awk '{print $1/2}'`
+		nb_marker=`head -n 1 $1 | tr '\t' '\n' | grep "." -c | awk '{print $1-1}'`
+		sed -e 's/KN/'"$j"'/g' -e 's/name_output/st'"$i"'_'"$j"'_results/g' -e 's/name_sample/'"$1"'/g' -e 's/nb_sample/'"$nb_sample"'/g' -e 's/nb_marker/'"$nb_marker"'/g' mainparams > ./st"$i"_"$j"_"$1".dir/mainparams
+		cp extraparams ./st"$i"_"$j"_"$1".dir/
+		cp structure ./st"$i"_"$j"_"$1".dir/
+		r1=`shuf -i1-9 -n1`
+		r2=`shuf -i1-9 -n1`
+		r3=`shuf -i1-9 -n1`
+		cp run.sh ./st"$i"_"$j"_"$1".dir/st"$i"_"$j".sh
+		sed -e 's/structure/structure\ \-D\ '"$r1"''"$r2"''"$r3"'/g' ./st"$i"_"$j"_"$1".dir/st"$i"_"$j".sh > ./st"$i"_"$j"_"$1".dir/st"$i"_"$j"_2.sh
+		cd ./st"$i"_"$j"_"$1".dir/
+		chmod 755 ./st"$i"_"$j"_2.sh
+		nohup ./st"$i"_"$j"_2.sh &
+		cd ..
+		done
+	done
+
+##FST between pop
+vcftools --vcf spaced_gatk4_snp_q20_miss05_snponly_bi.recode.vcf --weir-fst-pop pop1_list --weir-fst-pop pop2_list
+
+##FST bootstrap
+cp $1 tempvcf.output.genind
+R --slave --vanilla --quiet --no-save --args <<EEE
+	library("hierfstat")
+	library("adegenet")
+	Mydata<- read.table("tempvcf.output.genind", header = TRUE)
+	locus <- Mydata[, c(3:ncol(Mydata))]    
+	colnames(locus) <- gsub("_", colnames(locus))
+	ind <- as.character(Mydata$sample) # labels of the individuals
+	population <- as.character(Mydata$pop) # labels of the populations
+	Mydata1 <- df2genind(locus, ploidy = 2, ind.names = ind, pop = population, sep = "",NA.char="NA")
+	Mydata2 <- genind2hierfstat(Mydata1)
+	df2 <- transform(Mydata2, pop=sample(pop))
+	mat.obs<-pairwise.WCfst(Mydata2,diploid=TRUE)
+	NBPERM <- 999 # this is the number of permutations used for the p-values; for a publication at least 999 would be required.
+	mat.perm <- lapply(1:NBPERM, function(i) pairwise.WCfst(transform(Mydata2, pop=sample(pop)),diploid=TRUE))
+	for(i in 1:(nrow(mat.obs)-1)){
+	  for(j in 2:nrow(mat.obs)){
+	    print(paste(rownames(mat.obs)[i],rownames(mat.obs)[j],sep="-"))
+	    print(as.randtest(na.omit(sapply(1:NBPERM, function(k) mat.perm[[k]][i,j])), mat.obs[i,j], alter="greater"))
+	  }
+	}
+EEE
+
+##PCA
+R --slave --vanilla --quiet --no-save --args <<EEE
+library("adegenet")
+data<-read.structure("spaced_gatk4_snp_q20_miss05_snponly_bi.recode.str",n.ind=514,n.loc=2002,onerowperind=FALSE,col.lab=1,col.pop=2,col.others=NULL,row.marknames=NULL,NA.char=-9,ask=F) 
+is.genind(data)
+sansna<-scaleGen(data,scale=F, NA.method="mean")
+pca1 <- dudi.pca(sansna,cent=F,scale=F,scannf=FALSE,nf=3)
+barplot(pca1$eig[1:50],main="PCA eigenvalues", col=heat.colors(50))
+plot(pca1$li$Axis1*pca1$eig[1],pca1$li$Axis2*pca1$eig[2],pch=19,col=c("cyan4","darksalmon","darkseagreen2","orange","lightsteelblue","slateblue"))
+s.label(pca1$li)
+add.scatter.eig(pca1$eig[1:20], 3,1,2)
+s.class(pca1$li)
+s.label(pca1$li,clabel = 0,)
+s.label(pca1$li,boxes=FALSE,clabel=0.4)
+add.scatter.eig(pca1$eig[1:10], 3,1,2)
+s.class(pca1$li, pop(data),xax=1,yax=2,col=c(cat(paste(shQuote(popcol, type="cmd"), collapse=", "))),)
+s.class(pca1$li, pop(data),xax=1,yax=2,pch=19)
+EEE
+
+##IBD
+read.table("distances.txt",h=T,sep="\t")->data
+cor.test(data$weighted/(1-data$weighted),data$dist_direct_km,method="spearman")
+model<- lm(data$weighted/(1-data$weighted) ~ data$dist_direct_km, data = data)
+summary(model)
+plot(data$dist_direct_km,data$weighted/(1-data$weighted),pch=19,xlab="Distance (km)", ylab="FST/(1-FST)")
+abline(lm(model))
+model$coefficients
+
+##Genetic statistics for each POP
+Mydata <- read.table("POP_gatk4_snp_q20_miss05_snponly_bi.recode.genind", header = TRUE)
+locus <- Mydata[, c(3:ncol(Mydata))]    
+ind <- as.character(Mydata$sample) # labels of the individuals
+population <- as.character(Mydata$POP1) # labels of the populations
+Mydata1 <- df2genind(locus, ploidy = 2, ind.names = ind, pop = population, sep = "",NA.char="NA")
+Mydata2 <- genind2hierfstat(Mydata1)
+dim(Mydata2)
+basicstat <- basic.stats(Mydata2, diploid = TRUE, digits = 2)
+perloc<-basicstat$perloc
+overall<-data.frame(basicstat$overall)
+View(overall)
+mean(perloc$Ho)
+allelic.richness(Mydata2,min.n=NULL,diploid=TRUE)
+rich<-allelic.richness(Mydata2,min.n=NULL,diploid=TRUE)
+rich2<-data.frame(rich$Ar)
+mean(rich2$X1)
+write.table(overall,"$a_hierfstat_overall.txt", sep = "\t",quote = FALSE)
+
+#RDA
+Mydata <- read.table("spaced_gatk4_snp_q20_miss05_snponly_bi.recode.genind", header = TRUE)
+locus <- Mydata[, c(3:ncol(Mydata))]
+colnames(locus) <- gsub(".", "_", colnames(locus)) # locus names can't have "."
+ind <- as.character(Mydata$sample) # labels of the individuals
+population <- as.character(Mydata$pop) # labels of the populations
+Mydata1 <- df2genind(locus, ploidy = 2, ind.names = ind, pop = population, sep = "",NA.char="NA")
+#distance GENET
+distgenEUCL <- dist(Mydata1, method = "euclidean", diag = FALSE, upper = FALSE, p = 2)
+distgenEUCL<-as.matrix(distgenEUCL)
+#distance GEO
+keep_gps <- read.table("all_variables.txt", header=TRUE)
+Env_temp0<-merge(Mydata,keep_gps,by.x=c("sample"), by.y=c("sample"))
+Env_temp<-data.frame(Env_temp0$sample,Env_temp0$Lat,Env_temp0$Long)
+Env<-Env_temp[order(Env_temp$Env_temp0.sample),]
+Coor=Env[,3:2]
+Coorxy=data.frame(Env_temp0$Resource_preference,Env_temp0$Habitat_occupation)
+plot(Coor, asp=1)
+DistSpatial=gcd.hf(Env[,3:2])
+dbmem = dbmem(DistSpatial)
+summary(dbmem)
+adegraphics::s.label(Coor, nb = attr(dbmem, "listw"))
+ade4::s.value(Coorxy, dbmem[,1])
+Pcoa=pcoa(distgenEUCL)
+Pcoa
+X=Pcoa$vectors
+plot(X[,1], X[,2])
+Y=cbind(dbmem,Env_temp0$Resource_preference,Env_temp0$Habitat_occupation)
+cor(Y)
+COR<-cor(Y)
+summary(Y)
+rda1=rda(X, Y)
+vif(rda1)
+#explained variance
+RsquareAdj(rda1)
+#Assess the db-RDA global model probability
+anova(rda1, perm=999)
+rda0<-rda(X ~ 1, Y)
+rdaG<- rda(X ~ ., Y)
+Sel <- ordiR2step(rda0, scope = formula(rdaG), direction="both") 
+Sel$anova
+Ysel=cbind(Y$MEM1, Y$Env_temp0$Def_hosts_spp, Y$Env_temp0$Surface_km2)
+rdaS<- rda(X ,Ysel)
+summary(rdaS, scaling=1)
+RsquareAdj(rdaS)
+plot(rdaG,scaling=2)
+site=cbind(scores(rdaS, display="sites", choices=c(1,2), scaling=1))
+plot(rdaS, scaling=2)
+EEE
+
